@@ -3,7 +3,7 @@ const multer = require("multer");
 const ExcelJS = require("exceljs");
 const fs = require("fs");
 const path = require("path");
-const { PDFDocument } = require("pdf-lib");
+const { PDFDocument, StandardFonts } = require("pdf-lib");
 
 const app = express();
 const PORT = 3000;
@@ -29,6 +29,37 @@ const upload = multer({ storage });
 app.use(express.static("public"));
 app.use(express.json());
 
+// Helper function to extract cell value properly
+function extractCellValue(cell) {
+  if (!cell) return "";
+  
+  // Handle formula result
+  if (cell.formula) {
+    return cell.result || "";
+  }
+  
+  // Handle different value types
+  if (cell.value === null || cell.value === undefined) {
+    return "";
+  }
+  
+  // Handle rich text
+  if (typeof cell.value === 'object' && cell.value.richText) {
+    return cell.value.richText.map(rt => rt.text).join("") || "";
+  }
+  
+  // Handle other object types
+  if (typeof cell.value === 'object') {
+    // Try to get a string representation
+    return cell.text || 
+           (cell.value.toString && cell.value.toString() !== '[object Object]' ? 
+            cell.value.toString() : JSON.stringify(cell.value));
+  }
+  
+  // Regular value
+  return cell.value;
+}
+
 // Debug endpoint to check what worksheets are available
 app.get("/debug-excel", async (req, res) => {
   try {
@@ -41,16 +72,57 @@ app.get("/debug-excel", async (req, res) => {
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.readFile(filePath);
     
-    const worksheetInfo = workbook.worksheets.map(sheet => ({
-      id: sheet.id,
-      name: sheet.name,
-      rowCount: sheet.rowCount,
-      columnCount: sheet.columnCount
-    }));
+    const worksheetInfo = workbook.worksheets.map(sheet => {
+      // Get merged cell info
+      const merges = sheet.mergeCells._merges ? 
+        Object.keys(sheet._merges).map(key => {
+          const range = sheet._merges[key];
+          return {
+            range: key,
+            top: range.top,
+            left: range.left,
+            bottom: range.bottom,
+            right: range.right
+          };
+        }) : [];
+      
+      return {
+        id: sheet.id,
+        name: sheet.name,
+        rowCount: sheet.rowCount,
+        columnCount: sheet.columnCount,
+        mergedCells: merges,
+        hasMergedCells: merges.length > 0
+      };
+    });
+    
+    // Sample first few cells for debugging
+    const sampleCells = [];
+    if (workbook.worksheets.length > 0) {
+      const sheet = workbook.worksheets[0];
+      sheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+        if (rowNumber <= 5) { // Sample first 5 rows
+          const cells = [];
+          row.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+            cells.push({
+              address: cell.address,
+              type: cell.type,
+              value: cell.value,
+              formula: cell.formula,
+              result: cell.result,
+              text: extractCellValue(cell),
+              isMerged: cell.isMerged
+            });
+          });
+          sampleCells.push(cells);
+        }
+      });
+    }
     
     res.json({
       worksheetCount: workbook.worksheets.length,
-      worksheets: worksheetInfo
+      worksheets: worksheetInfo,
+      sampleCells
     });
   } catch (err) {
     console.error("Debug error:", err);
@@ -106,34 +178,63 @@ app.get("/data", async (req, res) => {
     
     console.log(`Found worksheet: ${worksheet.name} with ${worksheet.rowCount} rows and ${worksheet.columnCount} columns`);
     
-    const data = [];
+    // Get merged cell information
+    const mergedCells = worksheet.mergeCells._merges ? 
+      Object.keys(worksheet._merges).map(key => {
+        const range = worksheet._merges[key];
+        return {
+          range: key,
+          top: range.top,
+          left: range.left,
+          bottom: range.bottom,
+          right: range.right
+        };
+      }) : [];
     
-    // Only process rows that have data
-    worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
-      // Filter out undefined and null values, but keep numeric zeros
-      const rowValues = row.values.slice(1).map(value => {
-        if (value && typeof value === 'object') {
-          // Handle Excel cell objects like Rich Text
-          return value.text || value.toString() || "";
-        }
-        return value === undefined || value === null ? "" : value;
+    console.log(`Found ${mergedCells.length} merged cell ranges`);
+    
+    // Create a matrix to store cell values
+    const maxRow = worksheet.rowCount;
+    const maxCol = worksheet.columnCount || 10; // Fallback if columnCount is not reliable
+    
+    // Initialize the data matrix with empty values
+    const dataMatrix = Array(maxRow).fill().map(() => Array(maxCol).fill(""));
+    
+    // Fill in values from the worksheet
+    worksheet.eachRow({ includeEmpty: true }, (row, rowIndex) => {
+      row.eachCell({ includeEmpty: true }, (cell, colIndex) => {
+        dataMatrix[rowIndex-1][colIndex-1] = extractCellValue(cell);
       });
+    });
+    
+    // Handle merged cells - copy the value to all cells in the merged range
+    mergedCells.forEach(merge => {
+      const topValue = dataMatrix[merge.top-1][merge.left-1];
       
-      // Only add rows that have at least one non-empty value
-      if (rowValues.some(val => val !== "")) {
-        data.push(rowValues);
+      // Copy the top-left value to all cells in the merged range
+      for (let r = merge.top; r <= merge.bottom; r++) {
+        for (let c = merge.left; c <= merge.right; c++) {
+          dataMatrix[r-1][c-1] = topValue;
+        }
       }
     });
     
-    console.log(`Processed ${data.length} data rows`);
+    // Only include rows that have at least some data
+    const finalData = dataMatrix.filter(row => row.some(cell => cell !== ""));
     
     // Handle empty spreadsheet case
-    if (data.length === 0) {
+    if (finalData.length === 0) {
       // Return a default template with one empty row
       return res.json([["", "", "", ""]]);
     }
     
-    res.json(data);
+    console.log(`Processed ${finalData.length} data rows`);
+    
+    // Return the data along with merged cell information for the frontend
+    res.json({
+      data: finalData,
+      mergedCells: mergedCells
+    });
   } catch (err) {
     console.error("Data fetch error:", err);
     res.status(500).json({ error: err.message });
@@ -145,12 +246,18 @@ app.post("/save", async (req, res) => {
   try {
     const filePath = path.join(__dirname, "uploads", "data.xlsx");
     
-    if (!Array.isArray(req.body)) {
-      return res.status(400).json({ error: "Invalid data format. Expected an array." });
+    if (!req.body || !req.body.data) {
+      return res.status(400).json({ error: "Invalid data format. Expected {data: [...]}" });
     }
     
-    // Filter out empty rows
-    const dataToSave = req.body.filter(row => 
+    const dataToSave = req.body.data;
+    
+    if (!Array.isArray(dataToSave)) {
+      return res.status(400).json({ error: "Invalid data format. Expected data to be an array." });
+    }
+    
+    // Filter out completely empty rows
+    const filteredData = dataToSave.filter(row => 
       Array.isArray(row) && row.some(cell => cell !== null && cell !== "")
     );
     
@@ -171,22 +278,37 @@ app.post("/save", async (req, res) => {
       }
     }
     
-    // Clear existing content
+    // Preserve merged cells
+    const existingMerges = worksheet.mergeCells && worksheet._merges ? 
+      Object.keys(worksheet._merges) : [];
+    
+    // Clear existing content but remember merged cells
     worksheet.eachRow((row, rowNumber) => {
       worksheet.spliceRows(rowNumber, 1);
     });
     
     // Add new data
-    dataToSave.forEach((rowData, index) => {
-      const row = worksheet.getRow(index + 1);
-      row.values = [null, ...rowData]; // Add null at beginning for 1-based indexing
+    filteredData.forEach((rowData, rowIndex) => {
+      const row = worksheet.getRow(rowIndex + 1);
+      rowData.forEach((cellValue, colIndex) => {
+        const cell = row.getCell(colIndex + 1);
+        cell.value = cellValue;
+      });
       row.commit();
     });
+    
+    // Restore merged cells if provided in request
+    if (req.body.mergedCells && Array.isArray(req.body.mergedCells)) {
+      req.body.mergedCells.forEach(merge => {
+        const range = `${String.fromCharCode(64 + merge.left)}${merge.top}:${String.fromCharCode(64 + merge.right)}${merge.bottom}`;
+        worksheet.mergeCells(range);
+      });
+    }
     
     await workbook.xlsx.writeFile(filePath);
     res.json({ 
       message: "Saved successfully", 
-      rowCount: dataToSave.length 
+      rowCount: filteredData.length 
     });
   } catch (err) {
     console.error("Save error:", err);
@@ -222,64 +344,122 @@ app.get("/export-pdf", async (req, res) => {
     }
     
     const pdfDoc = await PDFDocument.create();
+    
+    // Embed a Unicode font that can handle special characters
+    const fontBytes = fs.readFileSync(path.join(__dirname, 'node_modules', 'pdf-lib', 'assets', 'fonts', 'times-roman.ttf'));
+    const customFont = await pdfDoc.embedFont(StandardFonts.TimesRoman);
+    
     let page = pdfDoc.addPage([600, 800]);
     
     const titleText = `Excel Data Export - ${worksheet.name}`;
     page.drawText(titleText, { 
       x: 50, 
       y: 780, 
-      size: 16 
+      size: 16,
+      font: customFont
     });
     
     page.drawText(`Generated on: ${new Date().toLocaleDateString()}`, {
       x: 50,
       y: 760,
-      size: 10
+      size: 10,
+      font: customFont
     });
     
     let y = 730;
     let rowCount = 0;
     const rowsPerPage = 30;
     
-    // Extract data, handling empty rows properly
-    const excelData = [];
-    worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
-      // Process cell values to handle objects and formatting
-      const rowValues = row.values.slice(1).map(value => {
-        if (value && typeof value === 'object') {
-          return value.text || value.toString() || "";
-        }
-        return value === undefined || value === null ? "" : String(value);
+    // Get merged cell information
+    const mergedCells = worksheet.mergeCells._merges ? 
+      Object.keys(worksheet._merges).map(key => {
+        const range = worksheet._merges[key];
+        return {
+          range: key,
+          top: range.top,
+          left: range.left,
+          bottom: range.bottom,
+          right: range.right
+        };
+      }) : [];
+    
+    // Create a matrix to store cell values
+    const maxRow = worksheet.rowCount;
+    const maxCol = worksheet.columnCount || 10;
+    
+    // Initialize the data matrix with empty values
+    const dataMatrix = Array(maxRow).fill().map(() => Array(maxCol).fill(""));
+    
+    // Fill in values from the worksheet
+    worksheet.eachRow({ includeEmpty: true }, (row, rowIndex) => {
+      row.eachCell({ includeEmpty: true }, (cell, colIndex) => {
+        dataMatrix[rowIndex-1][colIndex-1] = extractCellValue(cell);
       });
+    });
+    
+    // Handle merged cells
+    mergedCells.forEach(merge => {
+      const topValue = dataMatrix[merge.top-1][merge.left-1];
       
-      if (rowValues.some(val => val !== "")) {
-        excelData.push(rowValues);
+      // Copy the top-left value to all cells in the merged range
+      for (let r = merge.top; r <= merge.bottom; r++) {
+        for (let c = merge.left; c <= merge.right; c++) {
+          dataMatrix[r-1][c-1] = topValue;
+        }
       }
     });
     
-    if (excelData.length === 0) {
-      page.drawText("No data found in spreadsheet", { x: 50, y, size: 12 });
+    // Only include rows that have at least some data
+    const finalData = dataMatrix.filter(row => row.some(cell => cell !== ""));
+    
+    if (finalData.length === 0) {
+      page.drawText("No data found in spreadsheet", { 
+        x: 50, 
+        y, 
+        size: 12,
+        font: customFont
+      });
     } else {
       // Calculate column widths based on content
       const maxColumnWidth = 100;
       const padding = 10;
       let columnWidths = [];
       
-      // Initialize with header widths
-      if (excelData.length > 0) {
-        columnWidths = excelData[0].map(header => 
-          Math.min(maxColumnWidth, (String(header).length * 7) + padding)
-        );
+      // Initialize with header widths if available
+      if (finalData.length > 0) {
+        const firstRow = finalData[0];
+        columnWidths = firstRow.map((header, index) => {
+          // Check all values in this column to determine appropriate width
+          const maxContentLength = Math.max(// Check all values in this column to determine appropriate width
+            ...finalData.map(row => {
+              const cellContent = String(row[index] || "");
+              return cellContent.length;
+            })
+          );
+          return Math.min(maxColumnWidth, (maxContentLength * 6) + padding);
+        });
       }
       
-      // Add table headers
+      // Draw table headers
       let x = 50;
-      excelData[0].forEach((header, colIndex) => {
-        page.drawText(String(header).substring(0, 15), { 
-          x,
-          y,
-          size: 11
-        });
+      finalData[0].forEach((header, colIndex) => {
+        // Clean and sanitize the text for PDF
+        const headerText = String(header || "")
+          .replace(/[^\x00-\x7F]/g, " ") // Replace non-ASCII with space
+          .substring(0, 15); // Limit length
+        
+        if (headerText.trim()) {
+          try {
+            page.drawText(headerText, { 
+              x,
+              y,
+              size: 11,
+              font: customFont
+            });
+          } catch (err) {
+            console.warn(`Could not draw text "${headerText}": ${err.message}`);
+          }
+        }
         x += columnWidths[colIndex] || 100;
       });
       
@@ -295,7 +475,7 @@ app.get("/export-pdf", async (req, res) => {
       y -= 10;
       
       // Draw data rows
-      for (let i = 1; i < excelData.length; i++) {
+      for (let i = 1; i < finalData.length; i++) {
         // Check if we need a new page
         if ((i - 1) % rowsPerPage === 0 && i > 1) {
           page = pdfDoc.addPage([600, 800]);
@@ -305,21 +485,33 @@ app.get("/export-pdf", async (req, res) => {
           page.drawText(`Excel Data Export (continued) - Page ${Math.floor((i-1)/rowsPerPage) + 1}`, {
             x: 50,
             y: 780,
-            size: 14
+            size: 14,
+            font: customFont
           });
           
-          y = 750;
+          y = 730;
         }
         
         // Draw row
         x = 50;
-        excelData[i].forEach((cell, colIndex) => {
-          const cellText = String(cell).substring(0, 20);
-          page.drawText(cellText, { 
-            x, 
-            y,
-            size: 10
-          });
+        finalData[i].forEach((cell, colIndex) => {
+          // Clean and sanitize the text for PDF
+          const cellText = String(cell || "")
+            .replace(/[^\x00-\x7F]/g, " ") // Replace non-ASCII with space
+            .substring(0, 20); // Limit length
+          
+          if (cellText.trim()) {
+            try {
+              page.drawText(cellText, { 
+                x, 
+                y,
+                size: 10,
+                font: customFont
+              });
+            } catch (err) {
+              console.warn(`Could not draw text "${cellText}": ${err.message}`);
+            }
+          }
           x += columnWidths[colIndex] || 100;
         });
         
@@ -359,3 +551,4 @@ app.listen(PORT, () => {
   console.log(`- Export as PDF: GET /export-pdf`);
   console.log(`- Debug Excel file: GET /debug-excel`);
 });
+            
